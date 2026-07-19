@@ -135,6 +135,7 @@ def run_agent(user_input: str, max_turns: int = 5, repeat_limit: int = 2):
        
         content = msg.content or ""
         print(f"模型输出: {content}")
+        messages.append({"role": "assistant", "content": content})
 
         action, action_input = parse_action(content)
 
@@ -161,7 +162,6 @@ def run_agent(user_input: str, max_turns: int = 5, repeat_limit: int = 2):
 
         print(f"[调用工具] {action}({action_input})")
         result = TOOL_FUNCS[action](action_input)
-        messages.append({"role": "assistant", "content": content})
         messages.append({
             "role": "user",
             "content": f"Observation: {result}",

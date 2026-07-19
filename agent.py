@@ -1,131 +1,85 @@
+"""
+最小 ReAct Agent · DeepSeek 版(from scratch,无框架)
+运行: uv run agent.py
+原理: LLM(决策) + 工具(执行) + 循环(多步推理)
+模型自己决定「调不调工具、调哪个、结果够不够」,不够就再转一圈。
+"""
 import os
-import sys
 import json
-import requests
-import re
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-API_URL = "http://knot.woa.com/apigw/api/v1/agents/agui/e686a019f9ef40f899df3e2127e93310"
-KNOT_API_TOKEN = os.getenv("KNOT_API_TOKEN")
-KNOT_API_USER = os.getenv("KNOT_API_USER")
-
-headers = {
-    "x-knot-api-token": KNOT_API_TOKEN,
-    "x-knot-api-user": KNOT_API_USER,
-}
+# DeepSeek 官方 OpenAI 兼容地址(注意:不要加 /v1)
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com",
+)
 
 
-def calculator(expression: str) -> str:
+def calculator(expr: str) -> str:
+    """计算一个数学表达式,例如 '23*47'。"""
     try:
-        allowed = set("0123456789+-*/(). ")
-        if not set(expression) <= allowed:
-            return "Error: 只允许数字和 + - * / ( )"
-        return str(eval(expression, {"__builtins__": {}}, {}))
+        return str(eval(expr, {"__builtins__": {}}))
     except Exception as e:
-        return f"Error: {e}"
+        return f"error: {e}"
 
 
-def call_knot_api(message: str, conversation_id: str = "") -> tuple:
-    chat_body = {
-        "input": {
-            "message": message,
-            "conversation_id": conversation_id,
-            "model": "deepseek-v3.1",
-            "stream": True,
-            "enable_web_search": False,
-            "chat_extra": {
-                "agent_client_uuid": "",
-                "attached_images": [],
-                "extra_headers": {},
-                "background_knowledge": "",
-                "enable_thinking": False,
-                "max_context_tokens": 200000,
-                "reasoning_effort": "medium",
+# 工具 schema(OpenAI function-calling 格式)
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculator",
+            "description": "计算一个数学表达式,例如 '23*47'。支持 + - * / 和括号。",
+            "parameters": {
+                "type": "object",
+                "properties": {"expr": {"type": "string"}},
+                "required": ["expr"],
             },
-            "temperature": 0.5,
-        }
+        },
     }
-
-    response = requests.post(API_URL, json=chat_body, headers=headers, stream=True)
-    response.raise_for_status()
-
-    full_content = ""
-    current_conversation_id = conversation_id
-
-    for chunk in response.iter_lines():
-        if not chunk:
-            continue
-        chunk_str = chunk.decode("utf-8").lstrip("data:").strip()
-        if chunk_str == "[DONE]":
-            break
-        try:
-            msg = json.loads(chunk_str)
-        except json.JSONDecodeError:
-            continue
-
-        if "type" not in msg:
-            continue
-
-        msg_type = msg["type"]
-
-        if "rawEvent" in msg:
-            event = msg["rawEvent"]
-            if "conversation_id" in event and event["conversation_id"]:
-                current_conversation_id = event["conversation_id"]
-
-        if msg_type == "TEXT_MESSAGE_CONTENT":
-            content = msg["rawEvent"].get("content", "")
-            full_content += content
-            print(content, end="")
-
-        elif msg_type == "THINKING_TEXT_MESSAGE_CONTENT":
-            content = msg["rawEvent"].get("content", "")
-            print(f"\n[思考] {content}", end="")
-
-        elif msg_type == "TOOL_CALL_START":
-            event = msg["rawEvent"]
-            tool_name = event.get("tool_name", "")
-            tool_input = event.get("tool_input", {})
-            print(f"\n[调用工具] {tool_name}({tool_input})")
-
-        elif msg_type == "TOOL_CALL_RESULT":
-            event = msg["rawEvent"]
-            result = event.get("result", "")
-            print(f"\n[工具结果] {result}")
-
-    print()
-    return full_content, current_conversation_id
+]
+TOOL_FUNCS = {"calculator": calculator}
 
 
-def run_agent():
-    conversation_id = ""
-    print("=" * 50)
-    print("欢迎使用 Knot AGUI Agent")
-    print("输入 'quit' 或 'exit' 退出")
-    print("=" * 50)
+def run(user_input: str, max_turns: int = 5):
+    messages = [{"role": "user", "content": user_input}]
+    for turn in range(1, max_turns + 1):
+        print(f"\n--- 第 {turn} 轮推理 ---")
+        resp = client.chat.completions.create(
+            # ⚠️ 用 deepseek-chat:V3 支持稳定 tool calling
+            #    deepseek-reasoner(R1)不支持稳定工具调用,别在这里用
+            model="deepseek-chat",
+            messages=messages,
+            tools=TOOLS,
+        )
+        msg = resp.choices[0].message
+        # 把模型这一轮完整回包(含可能的 tool_calls)存回上下文
+        messages.append(msg.model_dump())
 
-    while True:
-        print("\n" + "-" * 30)
-        user_input = input("你: ").strip()
+        # 模型没调工具 = 它觉得能直接回答了
+        if not msg.tool_calls:
+            print("最终回答:", msg.content)
+            return
 
-        if user_input.lower() in ("quit", "exit"):
-            print("再见！")
-            break
-
-        if not user_input:
-            print("请输入内容")
-            continue
-
-        print("\nAgent:", end="")
-        _, conversation_id = call_knot_api(user_input, conversation_id)
+        # 模型决定调工具 → 代码执行 → 把结果回填上下文,进入下一轮
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments)
+            print(f"[调用工具] {tc.function.name}({args})")
+            result = TOOL_FUNCS[tc.function.name](**args)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                }
+            )
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        q = " ".join(sys.argv[1:])
-        print("\n=== 最终回答 ===")
-        call_knot_api(q)
-    else:
-        run_agent()
+    run(
+        "一个游戏里 137 个敌人,每个掉 24 金币,总共多少金币?"
+        "再乘以 1.15 的暴击加成是多少?"
+    )
